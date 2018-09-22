@@ -23,7 +23,7 @@ from .const import (
     MLS_PER_SECOND, DAYS_SHIFT
 )
 from .six import utob, MemoryIO, long, iteritems, mk_bits
-from .read import HEADER_SCHEMA, SYNC_SIZE, MAGIC
+from .read import HEADER_SCHEMA, SYNC_SIZE, MAGIC, reader
 from .schema import extract_record_type, extract_logical_type, parse_schema
 from ._schema_common import SCHEMA_DEFS
 from ._timezone import epoch
@@ -460,6 +460,25 @@ except ImportError:
     pass
 
 
+def _is_appendable(file_object):
+    """Checks to see if the file is appendable. For it to be in this mode, it
+    should be readable and not be at the beginning of the file
+    """
+    if file_object.tell() != 0:
+        # File must be readable so that we can get the header information. If
+        # it isn't, the resulting avro file will be unreadable later so we
+        # should fail here to indicate the wrong mode was used
+        if file_object.readable():
+            return True
+        else:
+            raise ValueError(
+                "When appending to an avro file you must use the " +
+                "'a+' mode, not just 'a'"
+            )
+    else:
+        return False
+
+
 class Writer(object):
 
     def __init__(self,
@@ -472,20 +491,42 @@ class Writer(object):
         self.fo = fo
         self.schema = parse_schema(schema)
         self.validate_fn = validate if validator is True else validator
-        self.sync_marker = urandom(SYNC_SIZE)
         self.io = MemoryIO()
         self.block_count = 0
-        self.metadata = metadata or {}
-        self.metadata['avro.codec'] = codec
-        self.metadata['avro.schema'] = json.dumps(schema)
         self.sync_interval = sync_interval
 
-        try:
-            self.block_writer = BLOCK_WRITERS[codec]
-        except KeyError:
-            raise ValueError('unrecognized codec: %r' % codec)
+        if _is_appendable(self.fo):
+            end_of_file = self.fo.tell()
 
-        write_header(self.fo, self.metadata, self.sync_marker)
+            # Seed to the beginning to read the header
+            self.fo.seek(0)
+            avro_reader = reader(self.fo)
+            header = avro_reader._header
+
+            file_writer_schema = parse_schema(avro_reader.writer_schema)
+            if self.schema != file_writer_schema:
+                msg = "Provided schema {} does not match file writer_schema {}"
+                raise ValueError(msg.format(self.schema, file_writer_schema))
+
+            codec = avro_reader.metadata.get("avro.codec", "null")
+
+            self.sync_marker = header["sync"]
+            self.fo.seek(end_of_file)
+
+            self.block_writer = BLOCK_WRITERS[codec]
+        else:
+            self.sync_marker = urandom(SYNC_SIZE)
+
+            self.metadata = metadata or {}
+            self.metadata['avro.codec'] = codec
+            self.metadata['avro.schema'] = json.dumps(schema)
+
+            try:
+                self.block_writer = BLOCK_WRITERS[codec]
+            except KeyError:
+                raise ValueError('unrecognized codec: %r' % codec)
+
+            write_header(self.fo, self.metadata, self.sync_marker)
 
     def dump(self):
         write_long(self.fo, self.block_count)
